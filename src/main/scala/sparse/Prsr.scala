@@ -106,8 +106,8 @@ object OptionParsers extends RegexParsers {
   }
   
   def parse[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = p match {
-    case Done(o) => o.map((_,args))
-    case OptP(opt) => optionSearch(opt, args) <+> opt.params.default.strengthR(args)
+    case Done(o) => o.strengthR(args)
+    case OptP(opt) => optionSearch(opt, args)
     case Chain(opt, rest) => for {
       (f, rem) <- parse(rest, args)
       (v, rem2) <- parse(opt, rem)
@@ -115,11 +115,15 @@ object OptionParsers extends RegexParsers {
     case Alt(left, right) => parse(left, args) <+> parse(right, args)
   }
   
-  def evalParser[T](p: Prsr[T]): Option[T] = p match {
+  def parseDefault[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = evalDefault(p).strengthR(args)
+  
+  def fullParse[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = parse(p, args) <+> parseDefault(p, args)
+  
+  def evalDefault[T](p: Prsr[T]): Option[T] = p match {
     case Done(o) => o
-    case OptP(_) => None
-    case Chain(opt, rest) => evalParser(opt) <*> evalParser(rest)
-    case Alt(left, right) => evalParser(left) <+> evalParser(right)
+    case OptP(opt) => opt.params.default
+    case Chain(opt, rest) => evalDefault(opt) <*> evalDefault(rest)
+    case Alt(left, right) => evalDefault(left) <+> evalDefault(right)
   }
   
   def updateParams[T](f: OptParams[T]=>OptParams[T], p: Prsr[T]): Prsr[T] = p match {
@@ -161,7 +165,7 @@ object OptionParsers extends RegexParsers {
   case class User(name: String, id: Int)
   
   val testParser: Prsr[User] = (
-      strOpt("name").mod(short('n') |+| metavar("NME") |+| help("The name of the user")) 
+      strOpt("name").mod(short('n') |+| metavar("NME") |+| help("The name of the user") |+| default("John")) 
       |@| (intOpt("id").mod(help("The id of the user") |+| default(0)))
       ) { User.apply }
 }
