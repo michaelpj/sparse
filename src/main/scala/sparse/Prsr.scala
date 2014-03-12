@@ -115,17 +115,6 @@ object OptionParsers extends RegexParsers {
     case Alt(left, right) => parse(left, args) <+> parse(right, args)
   }
   
-  def parseDefault[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = evalDefault(p).strengthR(args)
-  
-  def fullParse[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = parse(p, args) <+> parseDefault(p, args)
-  
-  def evalDefault[T](p: Prsr[T]): Option[T] = p match {
-    case Done(o) => o
-    case OptP(opt) => opt.params.default
-    case Chain(opt, rest) => evalDefault(opt) <*> evalDefault(rest)
-    case Alt(left, right) => evalDefault(left) <+> evalDefault(right)
-  }
-  
   def updateParams[T](f: OptParams[T]=>OptParams[T], p: Prsr[T]): Prsr[T] = p match {
     case OptP(o) => OptP(o.copy(params = f(o.params)))
     case Alt(left, right) => updateParams(f, left) <+> updateParams(f, right)
@@ -150,16 +139,14 @@ object OptionParsers extends RegexParsers {
     def append(a: Mod[T], b: => Mod[T]): Mod[T] = Mod(a.underlying compose b.underlying)
   }
   
-  def long[T](n: String): ModP[T] = Mod {
-    case opt@OptP(o) => Alt(opt, OptP(o.copy(name=Long(n))))
-    case o => o
-  }
   def short[T](n: Char): ModP[T] = Mod {
-    case opt@OptP(o) => Alt(opt, OptP(o.copy(name=Short(n))))
+    // put this option first, so defaults don't get in front of us
+    case OptP(o) => Alt(OptP(o.copy(name=Short(n))), OptP(o))
+    case Alt(l, r) => short(n)(l) <+> short(n)(r)
     case o => o
   }
   def metavar[T](meta: String): ModP[T] = Mod.optMod(_.copy(metavar=meta))
-  def default[T](value: T): ModP[T] = Mod.optMod(_.copy(default=Some(value)))
+  def default[T](value: T): ModP[T] = Mod(p => p <+> value.point[Prsr])
   def help[T](value: String): ModP[T] = Mod.optMod(_.copy(help=value))
   
   case class User(name: String, id: Int)
