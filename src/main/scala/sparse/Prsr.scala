@@ -42,15 +42,17 @@ object OptionParsers extends RegexParsers {
     case Short(n) => '"' + "-" + n.toString + '"'
   }
   
-  case class Opt[T](name: Name, parser: Parser[T], metavar: String = "arg") {
-    def matches(s: String): Boolean = name match {
+  case class OptParams(names: List[Name] = List(), doc: Option[String] = None, metavar: String = "ARG")
+  
+  case class Opt[T](parser: Parser[T], default: Option[T] = None, params: OptParams = OptParams()) {
+    def matches(s: String): Boolean = params.names.exists {
       case Long(n) => s == "--" + n
       case Short(c) => s == "-" + c
     }
   }
   
   implicit def optionFunctor: Functor[Opt] = new Functor[Opt] {
-    def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = Opt(fa.name, fa.parser.map(f), fa.metavar)
+    def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = Opt(fa.parser.map(f), fa.default.map(f), fa.params)
   }
   
   sealed trait Prsr[T] {
@@ -92,10 +94,10 @@ object OptionParsers extends RegexParsers {
     def empty[A]: Prsr[A] = Done(None)
   }
 
-  def option[T](name: String, p: Parser[T]): Prsr[T] = OptP(Opt(Long(name), p))
+  def option[T](p: Parser[T], m: ModP[T]): Prsr[T] = m(OptP(Opt(p)))
   def default[T](t: T): Prsr[T] = t.point[Prsr]
-  def strOpt(name: String): Prsr[String] = option(name, """.*""".r)
-  def intOpt(name: String): Prsr[Int] = option(name, """\d+""".r ^^ {_.toInt})
+  def strOpt(name: String): Prsr[String] = option(""".*""".r, long(name))
+  def intOpt(name: String): Prsr[Int] = option("""\d+""".r ^^ {_.toInt}, long(name))
   
   //def flag[T](parser: Parser[T], default: T): Prsr[T] = active.point[Prsr] <+> default.point[Prsr]
   
@@ -116,8 +118,8 @@ object OptionParsers extends RegexParsers {
     case Alt(left, right) => parse(left, args) <+> parse(right, args)
   }
   
-  def updateOpt[T](f: Opt[T]=>Opt[T], p: Prsr[T]): Prsr[T] = p match {
-    case OptP(o) => OptP(f(o))
+  def updateOpt[T](f: OptParams=>OptParams, p: Prsr[T]): Prsr[T] = p match {
+    case OptP(o) => OptP(o.copy(params = f(o.params)))
     case Alt(left, right) => updateOpt(f, left) <+> updateOpt(f, right)
     case o => o
   }
@@ -130,7 +132,7 @@ object OptionParsers extends RegexParsers {
   
   object Mod {
     def apply[T](f: T => T) = new Mod[T] { val underlying = f }
-    def optMod[T](f: Opt[T]=>Opt[T]): ModP[T] = Mod(updateOpt(f, _))
+    def optMod[T](f: OptParams=>OptParams): ModP[T] = Mod(updateOpt(f, _))
   }
   
   type ModP[T] = Mod[Prsr[T]]
@@ -140,24 +142,39 @@ object OptionParsers extends RegexParsers {
     def append(a: Mod[T], b: => Mod[T]): Mod[T] = Mod(a.underlying compose b.underlying)
   }
   def metavar[T](meta: String): ModP[T] = Mod.optMod(_.copy(metavar=meta))
+  def doc[T](value: String): ModP[T] = Mod.optMod(_.copy(doc=Some(value)))
+  def long[T](name: String): ModP[T] = Mod.optMod(ps => ps.copy(names=Long(name)::ps.names))
+  def short[T](name: Char): ModP[T] = Mod.optMod(ps => ps.copy(names=Short(name)::ps.names))
   
   case class User(name: String, id: Int)
   
   val testParser: Prsr[User] = (
-      (strOpt("name") <+> strOpt("-n") <+> default("John")).mod(metavar("NME"))
+      (strOpt("name") <+> strOpt("-n") <+> default("John").mod(metavar("NME")))
       |@| (intOpt("id"))
       ) { User.apply }
   
+  def getDoc[T](p: Prsr[T]): Option[String] = p match {
+    case Done(v) => None
+    case OptP(o) => o.params.doc
+    case Alt(l,r) => {
+      val ld = getDoc(l)
+      val rd = getDoc(r)
+      if (ld == rd) ld else (ld |@| rd) { _ + "\n" + _}
+    }
+    // Never document a chain
+    case Chain(opt, rest) => None
+  }
+  
   def show[T](p: Prsr[T]): Option[String] = p match {
-    case Done(v) => v.map(_ + " (default)")
-    case OptP(o) =>  Some(s"${show(o.name)} ${o.metavar}")
+    case Done(v) => None
+    case OptP(o) =>  Some(s"${o.params.names.map(show)} ${o.params.metavar}")
     case Alt(l,r) => for {
       left <- show(l)
       right = show(r).fold("")(" | " + _)
     } yield left + right
     case Chain(opt, rest) => for {
-      r <- show(rest)
-      o = show(opt).fold("")("\n" + _)
+      r <- show(opt)
+      o = show(rest).fold("")("\n" + _)
     } yield r + o
   }
 }
