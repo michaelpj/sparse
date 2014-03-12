@@ -37,12 +37,12 @@ object OptionParsers extends RegexParsers {
   case class Long(n: String) extends Name
   case class Short(c: Char) extends Name
   
-  case class OptParams[+T](metavar: String = "", help: String = "", default: Option[T] = None)
-  implicit def paramFunctor: Functor[OptParams] = new Functor[OptParams] {
-    def map[A,B](fa: OptParams[A])(f: A => B): OptParams[B] = fa.copy(default = fa.default.map(f))
+  def show(n: Name): String = n match {
+    case Long(n) => '"' + "--" + n + '"'
+    case Short(n) => '"' + "-" + n.toString + '"'
   }
   
-  case class Opt[T](name: Name, params: OptParams[T], parser: Parser[T]) {
+  case class Opt[T](name: Name, parser: Parser[T], metavar: String = "arg") {
     def matches(s: String): Boolean = name match {
       case Long(n) => s == "--" + n
       case Short(c) => s == "-" + c
@@ -50,7 +50,7 @@ object OptionParsers extends RegexParsers {
   }
   
   implicit def optionFunctor: Functor[Opt] = new Functor[Opt] {
-    def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = Opt(fa.name, fa.params.map(f), fa.parser.map(f))
+    def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = Opt(fa.name, fa.parser.map(f), fa.metavar)
   }
   
   sealed trait Prsr[T] {
@@ -92,7 +92,8 @@ object OptionParsers extends RegexParsers {
     def empty[A]: Prsr[A] = Done(None)
   }
 
-  def option[T](name: String, p: Parser[T]): Prsr[T] = OptP(Opt(Long(name), OptParams(), p))
+  def option[T](name: String, p: Parser[T]): Prsr[T] = OptP(Opt(Long(name), p))
+  def default[T](t: T): Prsr[T] = t.point[Prsr]
   def strOpt(name: String): Prsr[String] = option(name, """.*""".r)
   def intOpt(name: String): Prsr[Int] = option(name, """\d+""".r ^^ {_.toInt})
   
@@ -115,9 +116,9 @@ object OptionParsers extends RegexParsers {
     case Alt(left, right) => parse(left, args) <+> parse(right, args)
   }
   
-  def updateParams[T](f: OptParams[T]=>OptParams[T], p: Prsr[T]): Prsr[T] = p match {
-    case OptP(o) => OptP(o.copy(params = f(o.params)))
-    case Alt(left, right) => updateParams(f, left) <+> updateParams(f, right)
+  def updateOpt[T](f: Opt[T]=>Opt[T], p: Prsr[T]): Prsr[T] = p match {
+    case OptP(o) => OptP(f(o))
+    case Alt(left, right) => updateOpt(f, left) <+> updateOpt(f, right)
     case o => o
   }
   
@@ -129,7 +130,7 @@ object OptionParsers extends RegexParsers {
   
   object Mod {
     def apply[T](f: T => T) = new Mod[T] { val underlying = f }
-    def optMod[T](f: OptParams[T]=>OptParams[T]): ModP[T] = Mod(updateParams(f, _))
+    def optMod[T](f: Opt[T]=>Opt[T]): ModP[T] = Mod(updateOpt(f, _))
   }
   
   type ModP[T] = Mod[Prsr[T]]
@@ -138,21 +139,25 @@ object OptionParsers extends RegexParsers {
     def zero: Mod[T] = Mod(identity)
     def append(a: Mod[T], b: => Mod[T]): Mod[T] = Mod(a.underlying compose b.underlying)
   }
-  
-  def short[T](n: Char): ModP[T] = Mod {
-    // put this option first, so defaults don't get in front of us
-    case OptP(o) => Alt(OptP(o.copy(name=Short(n))), OptP(o))
-    case Alt(l, r) => short(n)(l) <+> short(n)(r)
-    case o => o
-  }
   def metavar[T](meta: String): ModP[T] = Mod.optMod(_.copy(metavar=meta))
-  def default[T](value: T): ModP[T] = Mod(p => p <+> value.point[Prsr])
-  def help[T](value: String): ModP[T] = Mod.optMod(_.copy(help=value))
   
   case class User(name: String, id: Int)
   
   val testParser: Prsr[User] = (
-      strOpt("name").mod(short('n') |+| metavar("NME") |+| help("The name of the user") |+| default("John")) 
-      |@| (intOpt("id").mod(help("The id of the user") |+| default(0)))
+      (strOpt("name") <+> strOpt("-n") <+> default("John")).mod(metavar("NME"))
+      |@| (intOpt("id"))
       ) { User.apply }
+  
+  def show[T](p: Prsr[T]): Option[String] = p match {
+    case Done(v) => v.map(_ + " (default)")
+    case OptP(o) =>  Some(s"${show(o.name)} ${o.metavar}")
+    case Alt(l,r) => for {
+      left <- show(l)
+      right = show(r).fold("")(" | " + _)
+    } yield left + right
+    case Chain(opt, rest) => for {
+      r <- show(rest)
+      o = show(opt).fold("")("\n" + _)
+    } yield r + o
+  }
 }
