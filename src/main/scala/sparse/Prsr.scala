@@ -7,10 +7,32 @@ import scalaz._
 import scalaz.syntax.applicativePlus._
 import scalaz.std.option._
 import scalaz.syntax.monoid._
-
+import scalaz.syntax.id._
 import scala.language.existentials
+import scala.util.parsing.combinator.Parsers
+import scala.util.parsing.input
+import scala.util.parsing.input.Position
+import scala.util.parsing.input.NoPosition
+import scala.util.matching.Regex
+import scala.util.parsing.combinator.RegexParsers
+
+case class ListReader[T](l: List[T]) extends input.Reader[T] {
+  def first: T = l.head
+  def rest: input.Reader[T] = ListReader(l.tail)
+  def pos: Position = NoPosition
+  def atEnd: Boolean = l.isEmpty
+}
+
+trait ListParsers extends Parsers {
+  type Elem = String
+  
+  def regex(r: Regex): Parser[Elem] = acceptIf(e => r.findFirstIn(e).isDefined)(e => s"Didn't match $e")
+  def parse[T](p: Parser[T], l: List[String]): ParseResult[T] = p(ListReader(l))
+  
+}
 
 object OptionParsers extends RegexParsers {
+  
   sealed trait Name
   case class Long(n: String) extends Name
   case class Short(c: Char) extends Name
@@ -19,9 +41,6 @@ object OptionParsers extends RegexParsers {
   implicit def paramFunctor: Functor[OptParams] = new Functor[OptParams] {
     def map[A,B](fa: OptParams[A])(f: A => B): OptParams[B] = fa.copy(default = fa.default.map(f))
   }
-  
-  sealed trait OptReader[T]
-  case class OptionReader[T](name: String, p: Parser[T]) extends OptReader[T]
   
   case class Opt[T](name: Name, params: OptParams[T], parser: Parser[T]) {
     def matches(s: String): Boolean = name match {
@@ -34,8 +53,8 @@ object OptionParsers extends RegexParsers {
     def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = Opt(fa.name, fa.params.map(f), fa.parser.map(f))
   }
   
-  sealed trait Prsr[+T] {
-    def mod[U>:T](m: ModP[U]): Prsr[U] = m(this)
+  sealed trait Prsr[T] {
+    def mod(m: ModP[T]) = m(this)
   }
   case class Done[T](t: Option[T]) extends Prsr[T]
   trait Chain[T] extends Prsr[T] {
@@ -56,7 +75,7 @@ object OptionParsers extends RegexParsers {
   
   def toOption[T](res: ParseResult[T]): Option[T] = res match {
     case Success(v, _) => Some(v)
-    case NoSuccess(_, _) => None
+    case NoSuccess(_, _) => {println("parse failed"); None }
   }
   
   implicit def parserApplicative: ApplicativePlus[Prsr] = new ApplicativePlus[Prsr] {
@@ -81,17 +100,17 @@ object OptionParsers extends RegexParsers {
   
   def optionSearch[T](o: Opt[T], args: List[String]): Option[(T, List[String])] = args match {
     case name :: value :: tail => 
-      if (o.matches(name)) toOption(parseAll(o.parser, value)).map((_, tail)) 
+      if (o.matches(name)) toOption(parse(o.parser, value)).strengthR(tail)
       else optionSearch(o, tail).map { case (t, as) => (t, name :: value :: as) }
     case _ => None
   }
   
   def parse[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = p match {
     case Done(o) => o.map((_,args))
-    case OptP(opt) => optionSearch(opt, args)
+    case OptP(opt) => optionSearch(opt, args) <+> opt.params.default.strengthR(args)
     case Chain(opt, rest) => for {
-      (v, rem) <- parse(opt, args)
-      (f, rem2) <- parse(rest, rem)
+      (f, rem) <- parse(rest, args)
+      (v, rem2) <- parse(opt, rem)
     } yield (f(v), rem2)
     case Alt(left, right) => parse(left, args) <+> parse(right, args)
   }
@@ -112,6 +131,7 @@ object OptionParsers extends RegexParsers {
   trait Mod[T] {
     val underlying: T=>T
     def apply(o: T) = underlying(o)
+    def |+|(b: => Mod[T]): Mod[T] = Mod(underlying compose b.underlying)
   }
   
   object Mod {
@@ -141,7 +161,7 @@ object OptionParsers extends RegexParsers {
   case class User(name: String, id: Int)
   
   val testParser: Prsr[User] = (
-      strOpt("name").mod(short[String]('n') |+| metavar("NME") |+| help("The name of the user")) 
-      |@| intOpt("id").mod(help("The id of the user"))
+      strOpt("name").mod(short('n') |+| metavar("NME") |+| help("The name of the user")) 
+      |@| (intOpt("id").mod(help("The id of the user") |+| default(0)))
       ) { User.apply }
 }
