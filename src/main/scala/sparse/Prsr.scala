@@ -35,8 +35,12 @@ trait ListParsers extends Parsers {
 
 object OptionParsers extends RegexParsers {
   type StateTOption[S, T] = StateT[Option, S, T]
-  type ArgStateT[G[_], T] = StateT[G, List[String], T]
-  type Eval[+T] = StateTOption[List[String], T]
+  type ArgStateT[G[+_], T] = StateT[G, List[String], T]
+  type Eval[T] = StateTOption[List[String], T]
+  implicit def plusEval: Plus[Eval] = new Plus[Eval] {
+    // do both with the same state and take the first one if it succeeds, otherwise the second
+    def plus[A](a: Eval[A], b: => Eval[A]): Eval[A] = StateT(s => a.run(s) <+> b.run(s))
+  }
   def lift[T](o: Option[T]): Eval[T] = o.liftM[ArgStateT]
   val ms = MonadState[StateTOption, List[String]]
   
@@ -45,8 +49,8 @@ object OptionParsers extends RegexParsers {
   case class Short(c: Char) extends Name
   
   def show(n: Name): String = n match {
-    case Long(n) => '"' + "--" + n + '"'
-    case Short(n) => '"' + "-" + n.toString + '"'
+    case Long(n) => "--" + n
+    case Short(n) => "-" + n.toString
   }
   
   case class OptParams(names: List[Name] = List(), doc: Option[String] = None, metavar: String = "ARG")
@@ -101,10 +105,9 @@ object OptionParsers extends RegexParsers {
     def empty[A]: Prsr[A] = Done(None)
   }
 
-  def option[T](p: Parser[T], m: ModP[T]): Prsr[T] = m(OptP(Opt(p)))
-  def default[T](t: T): Prsr[T] = t.point[Prsr]
-  def strOpt(name: String): Prsr[String] = option(""".*""".r, long(name))
-  def intOpt(name: String): Prsr[Int] = option("""\d+""".r ^^ {_.toInt}, long(name))
+  def option[T](p: Parser[T]): OptP[T] = OptP(Opt(p))
+  def strOpt(name: String): Prsr[String] = long(name)(option(""".*""".r))
+  def intOpt(name: String): Prsr[Int] = long(name)(option("""\d+""".r ^^ {_.toInt}))
   
   //def flag[T](parser: Parser[T], default: T): Prsr[T] = active.point[Prsr] <+> default.point[Prsr]
   
@@ -113,35 +116,35 @@ object OptionParsers extends RegexParsers {
     case _ => None
   }
   
-  def optionSearch2[T](o: Opt[T]): Eval[T] = for {
+  def optionSearch[T](o: Opt[T]): Eval[T] = for {
     args <- ms.get
-    foo <- args match {
+    value <- args match {
       case name :: value :: tail => 
-        if (o.matches(name)) lift(toOption(parse(o.parser, value)) <+> o.default)
-        else optionSearch2(o)
-      case _ => lift(None)
+        if (o.matches(name)) for {
+          v <- lift(toOption(parse(o.parser, value)))
+          _ <- ms.put(tail)
+        } yield v
+        else for {
+          _ <- ms.put(tail)
+          v <- optionSearch(o)
+          _ <- ms.modify(name :: value :: _)
+        } yield v
+      case _ => lift(o.default)
     }
-  } yield foo
+  } yield value
   
-  def optionSearch[T](o: Opt[T], args: List[String]): Option[(T, List[String])] = args match {
-    case name :: value :: tail => 
-      if (o.matches(name)) (toOption(parse(o.parser, value)) <+> o.default).strengthR(tail)
-      else optionSearch(o, tail).map { case (t, as) => (t, name :: value :: as) }
-    case _ => None
-  }
-  
-  def parse[T](p: Prsr[T], args: List[String]): Option[(T, List[String])] = p match {
-    case Done(o) => o.strengthR(args)
-    case OptP(opt) => optionSearch(opt, args)
+  def eval[T](p: Prsr[T]): Eval[T] = p match {
+    case Done(o) => lift(o)
+    case OptP(opt) => optionSearch(opt)
     case Chain(opt, rest) => for {
-      (f, rem) <- parse(rest, args)
-      (v, rem2) <- parse(opt, rem)
-    } yield (f(v), rem2)
-    case Alt(left, right) => parse(left, args) <+> parse(right, args)
+      f <- eval(rest)
+      v <- eval(opt)
+    } yield f(v)
+    case Alt(left, right) => eval(left) <+> eval(right)
   }
   
-  def updateOpt[T](f: OptParams=>OptParams, p: Prsr[T]): Prsr[T] = p match {
-    case OptP(o) => OptP(o.copy(params = f(o.params)))
+  def updateOpt[T](f: Opt[T]=>Opt[T], p: Prsr[T]): Prsr[T] = p match {
+    case OptP(o) => OptP(f(o))
     case Alt(left, right) => updateOpt(f, left) <+> updateOpt(f, right)
     case o => o
   }
@@ -154,7 +157,8 @@ object OptionParsers extends RegexParsers {
   
   object Mod {
     def apply[T](f: T => T) = new Mod[T] { val underlying = f }
-    def optMod[T](f: OptParams=>OptParams): ModP[T] = Mod(updateOpt(f, _))
+    def paramMod[T](f: OptParams=>OptParams): ModP[T] = Mod(updateOpt(o => o.copy(params = f(o.params)), _))
+    def optMod[T](f: Opt[T]=>Opt[T]): ModP[T] = Mod(updateOpt(f, _))
   }
   
   type ModP[T] = Mod[Prsr[T]]
@@ -163,40 +167,45 @@ object OptionParsers extends RegexParsers {
     def zero: Mod[T] = Mod(identity)
     def append(a: Mod[T], b: => Mod[T]): Mod[T] = Mod(a.underlying compose b.underlying)
   }
-  def metavar[T](meta: String): ModP[T] = Mod.optMod(_.copy(metavar=meta))
-  def doc[T](value: String): ModP[T] = Mod.optMod(_.copy(doc=Some(value)))
-  def long[T](name: String): ModP[T] = Mod.optMod(ps => ps.copy(names=Long(name)::ps.names))
-  def short[T](name: Char): ModP[T] = Mod.optMod(ps => ps.copy(names=Short(name)::ps.names))
+  def metavar[T](meta: String): ModP[T] = Mod.paramMod(_.copy(metavar=meta))
+  def doc[T](value: String): ModP[T] = Mod.paramMod(_.copy(doc=Some(value)))
+  def long[T](name: String): ModP[T] = Mod.paramMod(ps => ps.copy(names=Long(name)::ps.names))
+  def short[T](name: Char): ModP[T] = Mod.paramMod(ps => ps.copy(names=Short(name)::ps.names))
+  def default[T](value: T): ModP[T] = Mod.optMod(_.copy(default = Some(value)))
   
   case class User(name: String, id: Int)
   
   val testParser: Prsr[User] = (
-      (strOpt("name") <+> strOpt("-n") <+> default("John").mod(metavar("NME")))
-      |@| (intOpt("id"))
+      strOpt("name").mod(short('n') |+| metavar("NME") |+| doc("The user's name"))
+      |@| intOpt("id").mod(default(0) |+| doc("The user's id"))
       ) { User.apply }
   
-  def getDoc[T](p: Prsr[T]): Option[String] = p match {
-    case Done(v) => None
-    case OptP(o) => o.params.doc
+  def format[T](o: Opt[T]): String = o.params.names.map(show).mkString("|") + " " + o.params.metavar
+  def help[T](p: Prsr[T]): String = p match {
+    case Done(v) => ""
+    case OptP(o) => (for {
+      doc <- o.params.doc
+      args = format(o)
+    } yield s"$args \n $doc") getOrElse ""
     case Alt(l,r) => {
-      val ld = getDoc(l)
-      val rd = getDoc(r)
-      if (ld == rd) ld else (ld |@| rd) { _ + "\n" + _}
+      val left = help(l)
+      val right = help(r)
+      left + (if (right != "") " | " else "") + right
     }
-    // Never document a chain
-    case Chain(opt, rest) => None
+    case Chain(opt, rest) => {
+      val r = help(rest)
+      val o = help(opt)
+      r + (if (r != "") "\n" else "") + o
+    }
   }
   
-  def show[T](p: Prsr[T]): Option[String] = p match {
-    case Done(v) => None
-    case OptP(o) =>  Some(s"${o.params.names.map(show)} ${o.params.metavar}")
-    case Alt(l,r) => for {
-      left <- show(l)
-      right = show(r).fold("")(" | " + _)
-    } yield left + right
-    case Chain(opt, rest) => for {
-      r <- show(opt)
-      o = show(rest).fold("")("\n" + _)
-    } yield r + o
+  def usage[T](p: Prsr[T]): String = p match {
+    case Done(v) => ""
+    case OptP(o) => {
+      val f = format(o)
+      if (o.default.isDefined) s"[$f]" else f
+    }
+    case Alt(l,r) => s"alt(${usage(l)} ${usage(r)})"
+    case Chain(opt, rest) => usage(rest) + usage(opt)
   }
 }
