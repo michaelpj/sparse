@@ -17,23 +17,9 @@ import scala.util.parsing.combinator.RegexParsers
 import StateT._
 import scalaz.syntax.all._
 import scalaz.syntax.state._
+import Id._
 
-case class ListReader[T](l: List[T]) extends input.Reader[T] {
-  def first: T = l.head
-  def rest: input.Reader[T] = ListReader(l.tail)
-  def pos: Position = NoPosition
-  def atEnd: Boolean = l.isEmpty
-}
-
-trait ListParsers extends Parsers {
-  type Elem = String
-  
-  def regex(r: Regex): Parser[Elem] = acceptIf(e => r.findFirstIn(e).isDefined)(e => s"Didn't match $e")
-  def parse[T](p: Parser[T], l: List[String]): ParseResult[T] = p(ListReader(l))
-  
-}
-
-object OptionParsers extends RegexParsers {
+trait Eval {
   type StateTOption[S, T] = StateT[Option, S, T]
   type ArgStateT[G[+_], T] = StateT[G, List[String], T]
   type Eval[T] = StateTOption[List[String], T]
@@ -43,6 +29,27 @@ object OptionParsers extends RegexParsers {
   }
   def lift[T](o: Option[T]): Eval[T] = o.liftM[ArgStateT]
   val ms = MonadState[StateTOption, List[String]]
+}
+
+case class ListReader[T](l: List[T]) extends input.Reader[T] {
+  def first: T = l.head
+  def rest: input.Reader[T] = ListReader(l.tail)
+  def pos: Position = NoPosition
+  def atEnd: Boolean = l.isEmpty
+}
+
+trait ListParsers extends Parsers with Eval {
+  type Elem = String
+  def mkList(r: input.Reader[Elem]): List[Elem] = if (r.atEnd) Nil else r.first :: mkList(r.rest)
+  
+  def regex(r: Regex): Parser[Elem] = acceptIf(e => r.findFirstIn(e).isDefined)(e => s"Didn't match $e")
+  def parseEval[T](p: Parser[T], l: List[String]): Eval[T] = p(ListReader(l)) match {
+    case Success(v, rest) => constantStateT(v)(mkList(rest))
+    case NoSuccess(_, rest) => lift(None)
+  }
+}
+
+object OptionParsers extends ListParsers with Eval {
   
   sealed trait Name
   case class Long(n: String) extends Name
@@ -53,17 +60,29 @@ object OptionParsers extends RegexParsers {
     case Short(n) => "-" + n.toString
   }
   
-  case class OptParams(names: List[Name] = List(), doc: Option[String] = None, metavar: String = "ARG")
-  
-  case class Opt[T](parser: Parser[T], default: Option[T] = None, params: OptParams = OptParams()) {
-    def matches(s: String): Boolean = params.names.exists {
+  def matches(s: String, names: List[Name]): Boolean = names.exists {
       case Long(n) => s == "--" + n
       case Short(c) => s == "-" + c
     }
-  }
+  
+  /*sealed trait OptReader[T]
+  case class OptAndArgs[T](parser: Parser[T], names: List[Name] = List()) extends OptReader[T]
+  
+  implicit def readerFunctor= new Functor[OptReader] {
+    def map[A,B](fa: OptReader[A])(f: A=>B): OptReader[B] = fa match {
+      case OptAndArgs(p, l) => OptAndArgs(p.map(f), l)
+    }
+  }*/
+  
+  case class OptParams(doc: Option[String] = None, metavar: String = "ARG")
+  
+  sealed trait Opt[T]
+  case class OptAndArgs[T](parser: Parser[T], default: Option[T] = None, names: List[Name] = List(), params: OptParams = OptParams()) extends Opt[T]
   
   implicit def optionFunctor: Functor[Opt] = new Functor[Opt] {
-    def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = Opt(fa.parser.map(f), fa.default.map(f), fa.params)
+    def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = fa match {
+      case OptAndArgs(p, d, n, pa) => OptAndArgs(p.map(f), d.map(f), n, pa)
+    }
   }
   
   sealed trait Prsr[T] {
@@ -105,37 +124,36 @@ object OptionParsers extends RegexParsers {
     def empty[A]: Prsr[A] = Done(None)
   }
 
-  def option[T](p: Parser[T]): OptP[T] = OptP(Opt(p))
-  def strOpt(name: String): Prsr[String] = long(name)(option(""".*""".r))
-  def intOpt(name: String): Prsr[Int] = long(name)(option("""\d+""".r ^^ {_.toInt}))
+  def option[T](p: Parser[T]): OptP[T] = OptP(OptAndArgs(p))
+  def strOpt(name: String): Prsr[String] = long(name)(option(regex(""".*""".r)))
+  def intOpt(name: String): Prsr[Int] = long(name)(option(regex("""\d+""".r) ^^ {_.toInt}))
   
   //def flag[T](parser: Parser[T], default: T): Prsr[T] = active.point[Prsr] <+> default.point[Prsr]
   
-  def parseList[T](p: Parser[T], l: List[String]): Option[List[T]] = l match {
-    case h :: t => (toOption(parse(p, h)) |@| parseList(p, t)) { _ :: _ }
-    case _ => None
-  }
-  
-  def optionSearch[T](o: Opt[T]): Eval[T] = for {
+  def optSearch[T](o: OptAndArgs[T]): Eval[T] = for {
     args <- ms.get
     value <- args match {
-      case name :: value :: tail => 
-        if (o.matches(name)) for {
-          v <- lift(toOption(parse(o.parser, value)))
-          _ <- ms.put(tail)
-        } yield v
+      case name :: tail => { println(name); println(o.names);
+        if (matches(name, o.names)) { println("matched" + name ) ; parseEval(o.parser, tail) }
         else for {
           _ <- ms.put(tail)
-          v <- optionSearch(o)
-          _ <- ms.modify(name :: value :: _)
-        } yield v
+          v <- optSearch(o)
+          _ <- ms.modify(name ::  _)
+        } yield v }
       case _ => lift(o.default)
     }
   } yield value
   
+  def doOpt[T](o: Opt[T]): Eval[T] = o match {
+    case o@OptAndArgs(p, d, n, pa) => for {
+      _ <- ms.modify(_.dropWhile(arg => !(arg.startsWith("-"))))
+      v <- optSearch(o)
+    } yield v
+  }
+  
   def eval[T](p: Prsr[T]): Eval[T] = p match {
     case Done(o) => lift(o)
-    case OptP(opt) => optionSearch(opt)
+    case OptP(opt) => doOpt(opt)
     case Chain(opt, rest) => for {
       f <- eval(rest)
       v <- eval(opt)
@@ -171,7 +189,7 @@ object OptionParsers extends RegexParsers {
   def doc[T](value: String): ModP[T] = Mod.paramMod(_.copy(doc=Some(value)))
   def long[T](name: String): ModP[T] = Mod.paramMod(ps => ps.copy(names=Long(name)::ps.names))
   def short[T](name: Char): ModP[T] = Mod.paramMod(ps => ps.copy(names=Short(name)::ps.names))
-  def default[T](value: T): ModP[T] = Mod.optMod(_.copy(default = Some(value)))
+  def default[T](value: T): ModP[T] = Mod.optMod({ case OptAndArgs(p,d,n,pa) => OptAndArgs(p,Some(value),n,pa) })
   
   case class User(name: String, id: Int)
   
@@ -180,13 +198,22 @@ object OptionParsers extends RegexParsers {
       |@| intOpt("id").mod(default(0) |+| doc("The user's id"))
       ) { User.apply }
   
-  def format[T](o: Opt[T]): String = o.params.names.map(show).mkString("|") + " " + o.params.metavar
+  def format[T](o: Opt[T]): String = o match {
+    case OptAndArgs(p,d,n,pa) => n.map(show).mkString("|") + " " + pa.metavar
+  }
+  
+  def isOptional[T](o: Opt[T]): Boolean = o match {
+    case OptAndArgs(p,d,n,pa) => d.isDefined
+  }
+  
   def help[T](p: Prsr[T]): String = p match {
     case Done(v) => ""
-    case OptP(o) => (for {
-      doc <- o.params.doc
-      args = format(o)
-    } yield s"$args \n $doc") getOrElse ""
+    case OptP(o) => o match {
+      case OptAndArgs(p, d, n, pa) =>(for {
+        doc <- pa.doc
+        args = format(o)
+      } yield s"$args \n $doc") getOrElse ""
+    } 
     case Alt(l,r) => {
       val left = help(l)
       val right = help(r)
@@ -203,7 +230,7 @@ object OptionParsers extends RegexParsers {
     case Done(v) => ""
     case OptP(o) => {
       val f = format(o)
-      if (o.default.isDefined) s"[$f]" else f
+      if (isOptional(o)) s"[$f]" else f
     }
     case Alt(l,r) => s"alt(${usage(l)} ${usage(r)})"
     case Chain(opt, rest) => usage(rest) + usage(opt)
