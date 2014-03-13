@@ -4,17 +4,19 @@ import scala.util.parsing.combinator
 import scala.util.parsing.combinator.RegexParsers
 import scalaz.std.util.parsing.combinator.parser._
 import scalaz._
-import scalaz.syntax.applicativePlus._
+
 import scalaz.std.option._
-import scalaz.syntax.monoid._
-import scalaz.syntax.id._
 import scala.language.existentials
+import scala.language.higherKinds
 import scala.util.parsing.combinator.Parsers
 import scala.util.parsing.input
 import scala.util.parsing.input.Position
 import scala.util.parsing.input.NoPosition
 import scala.util.matching.Regex
 import scala.util.parsing.combinator.RegexParsers
+import StateT._
+import scalaz.syntax.all._
+import scalaz.syntax.state._
 
 case class ListReader[T](l: List[T]) extends input.Reader[T] {
   def first: T = l.head
@@ -32,6 +34,11 @@ trait ListParsers extends Parsers {
 }
 
 object OptionParsers extends RegexParsers {
+  type StateTOption[S, T] = StateT[Option, S, T]
+  type ArgStateT[G[_], T] = StateT[G, List[String], T]
+  type Eval[+T] = StateTOption[List[String], T]
+  def lift[T](o: Option[T]): Eval[T] = o.liftM[ArgStateT]
+  val ms = MonadState[StateTOption, List[String]]
   
   sealed trait Name
   case class Long(n: String) extends Name
@@ -101,9 +108,24 @@ object OptionParsers extends RegexParsers {
   
   //def flag[T](parser: Parser[T], default: T): Prsr[T] = active.point[Prsr] <+> default.point[Prsr]
   
+  def parseList[T](p: Parser[T], l: List[String]): Option[List[T]] = l match {
+    case h :: t => (toOption(parse(p, h)) |@| parseList(p, t)) { _ :: _ }
+    case _ => None
+  }
+  
+  def optionSearch2[T](o: Opt[T]): Eval[T] = for {
+    args <- ms.get
+    foo <- args match {
+      case name :: value :: tail => 
+        if (o.matches(name)) lift(toOption(parse(o.parser, value)) <+> o.default)
+        else optionSearch2(o)
+      case _ => lift(None)
+    }
+  } yield foo
+  
   def optionSearch[T](o: Opt[T], args: List[String]): Option[(T, List[String])] = args match {
     case name :: value :: tail => 
-      if (o.matches(name)) toOption(parse(o.parser, value)).strengthR(tail)
+      if (o.matches(name)) (toOption(parse(o.parser, value)) <+> o.default).strengthR(tail)
       else optionSearch(o, tail).map { case (t, as) => (t, name :: value :: as) }
     case _ => None
   }
