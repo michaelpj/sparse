@@ -224,6 +224,10 @@ object OptionParsers extends ListParsers with Eval {
     case Chain(opt, rest) => sep(usage(rest), " ", usage(opt))
   }
   
+  def allHelp[T](p: Prsr[T]): String = "Usage:" + usage(p) + "\n" + "Options: " + help(p)
+  
+  def helper[T](p: Prsr[T]): Prsr[T] = p <*> option(failure(allHelp(p))).mod(long("help") |+| short('h'))
+  
   sealed trait IsAdmin
   case object Yes extends IsAdmin
   case object No extends IsAdmin
