@@ -54,34 +54,28 @@ object OptionParsers extends ListParsers with Eval {
   sealed trait Name
   case class Long(n: String) extends Name
   case class Short(c: Char) extends Name
+  case class Plain(n: String) extends Name
   
   def show(n: Name): String = n match {
     case Long(n) => "--" + n
     case Short(n) => "-" + n.toString
+    case Plain(n) => n
   }
   
   def matches(s: String, names: List[Name]): Boolean = names.exists {
       case Long(n) => s == "--" + n
       case Short(c) => s == "-" + c
+      case Plain(n) => s == n 
     }
   
-  /*sealed trait OptReader[T]
-  case class OptAndArgs[T](parser: Parser[T], names: List[Name] = List()) extends OptReader[T]
-  
-  implicit def readerFunctor= new Functor[OptReader] {
-    def map[A,B](fa: OptReader[A])(f: A=>B): OptReader[B] = fa match {
-      case OptAndArgs(p, l) => OptAndArgs(p.map(f), l)
-    }
-  }*/
-  
-  case class OptParams(doc: Option[String] = None, metavar: String = "ARG")
+  case class OptParams(names: List[Name] = List(), doc: Option[String] = None, metavar: String = "ARG")
   
   sealed trait Opt[T]
-  case class OptAndArgs[T](parser: Parser[T], default: Option[T] = None, names: List[Name] = List(), params: OptParams = OptParams()) extends Opt[T]
+  case class OptAndArgs[T](parser: Parser[T], default: Option[T] = None, params: OptParams = OptParams()) extends Opt[T]
   
   implicit def optionFunctor: Functor[Opt] = new Functor[Opt] {
     def map[T,U](fa: Opt[T])(f: T => U): Opt[U] = fa match {
-      case OptAndArgs(p, d, n, pa) => OptAndArgs(p.map(f), d.map(f), n, pa)
+      case OptAndArgs(p, d, pa) => OptAndArgs(p.map(f), d.map(f), pa)
     }
   }
   
@@ -125,30 +119,31 @@ object OptionParsers extends ListParsers with Eval {
   }
 
   def option[T](p: Parser[T]): OptP[T] = OptP(OptAndArgs(p))
-  def strOpt(name: String): Prsr[String] = long(name)(option(regex(""".*""".r)))
-  def intOpt(name: String): Prsr[Int] = long(name)(option(regex("""\d+""".r) ^^ {_.toInt}))
+  def opt[T](name: String)(implicit p: Parser[T]): Prsr[T] = option(p).mod(long(name))
+  def flag[T](yes: T, no: T): OptP[T] = OptP(OptAndArgs(success(yes), Some(no)))
+  def flag[T](name: Char, yes: T, no: T): Prsr[T] = OptP(OptAndArgs(success(yes), Some(no))).mod(short(name))
+  implicit val strOpt: Parser[String] = regex(""".*""".r)
+  implicit val intOpt: Parser[Int] = regex("""\d+""".r) ^^ {_.toInt}
   
   //def flag[T](parser: Parser[T], default: T): Prsr[T] = active.point[Prsr] <+> default.point[Prsr]
   
   def optSearch[T](o: OptAndArgs[T]): Eval[T] = for {
+    _ <- ms.modify(_.dropWhile(arg => !(arg.startsWith("-"))))
     args <- ms.get
     value <- args match {
-      case name :: tail => { println(name); println(o.names);
-        if (matches(name, o.names)) { println("matched" + name ) ; parseEval(o.parser, tail) }
+      case name :: tail =>
+        if (matches(name, o.params.names)) parseEval(o.parser, tail)
         else for {
           _ <- ms.put(tail)
           v <- optSearch(o)
           _ <- ms.modify(name ::  _)
-        } yield v }
+        } yield v
       case _ => lift(o.default)
     }
   } yield value
   
   def doOpt[T](o: Opt[T]): Eval[T] = o match {
-    case o@OptAndArgs(p, d, n, pa) => for {
-      _ <- ms.modify(_.dropWhile(arg => !(arg.startsWith("-"))))
-      v <- optSearch(o)
-    } yield v
+    case o@OptAndArgs(p, d, pa) => optSearch(o)
   }
   
   def eval[T](p: Prsr[T]): Eval[T] = p match {
@@ -175,7 +170,9 @@ object OptionParsers extends ListParsers with Eval {
   
   object Mod {
     def apply[T](f: T => T) = new Mod[T] { val underlying = f }
-    def paramMod[T](f: OptParams=>OptParams): ModP[T] = Mod(updateOpt(o => o.copy(params = f(o.params)), _))
+    def paramMod[T](f: OptParams=>OptParams): ModP[T] = Mod(updateOpt({ 
+      case OptAndArgs(p,d,pa) => OptAndArgs(p,d,f(pa))
+    }, _))
     def optMod[T](f: Opt[T]=>Opt[T]): ModP[T] = Mod(updateOpt(f, _))
   }
   
@@ -185,31 +182,25 @@ object OptionParsers extends ListParsers with Eval {
     def zero: Mod[T] = Mod(identity)
     def append(a: Mod[T], b: => Mod[T]): Mod[T] = Mod(a.underlying compose b.underlying)
   }
+  
   def metavar[T](meta: String): ModP[T] = Mod.paramMod(_.copy(metavar=meta))
   def doc[T](value: String): ModP[T] = Mod.paramMod(_.copy(doc=Some(value)))
   def long[T](name: String): ModP[T] = Mod.paramMod(ps => ps.copy(names=Long(name)::ps.names))
   def short[T](name: Char): ModP[T] = Mod.paramMod(ps => ps.copy(names=Short(name)::ps.names))
-  def default[T](value: T): ModP[T] = Mod.optMod({ case OptAndArgs(p,d,n,pa) => OptAndArgs(p,Some(value),n,pa) })
-  
-  case class User(name: String, id: Int)
-  
-  val testParser: Prsr[User] = (
-      strOpt("name").mod(short('n') |+| metavar("NME") |+| doc("The user's name"))
-      |@| intOpt("id").mod(default(0) |+| doc("The user's id"))
-      ) { User.apply }
+  def default[T](value: T): ModP[T] = Mod.optMod({ case OptAndArgs(p,d,pa) => OptAndArgs(p,Some(value),pa) })
   
   def format[T](o: Opt[T]): String = o match {
-    case OptAndArgs(p,d,n,pa) => n.map(show).mkString("|") + " " + pa.metavar
+    case OptAndArgs(p,d,pa) => pa.names.map(show).mkString("|") + " " + pa.metavar
   }
   
   def isOptional[T](o: Opt[T]): Boolean = o match {
-    case OptAndArgs(p,d,n,pa) => d.isDefined
+    case OptAndArgs(p,d,pa) => d.isDefined
   }
   
   def help[T](p: Prsr[T]): String = p match {
     case Done(v) => ""
     case OptP(o) => o match {
-      case OptAndArgs(p, d, n, pa) =>(for {
+      case OptAndArgs(p, d, pa) =>(for {
         doc <- pa.doc
         args = format(o)
       } yield s"$args \n $doc") getOrElse ""
@@ -235,4 +226,17 @@ object OptionParsers extends ListParsers with Eval {
     case Alt(l,r) => s"alt(${usage(l)} ${usage(r)})"
     case Chain(opt, rest) => usage(rest) + usage(opt)
   }
+  
+  sealed trait IsAdmin
+  case object Yes extends IsAdmin
+  case object No extends IsAdmin
+  case object Maybe extends IsAdmin
+  
+  case class User(name: String, id: Int, admin: IsAdmin)
+  
+  val testParser: Prsr[User] = (
+      opt[String]("name").mod(short('n') |+| metavar("NME") |+| doc("The user's name"))
+      |@| opt[Int]("id").mod(default(0) |+| doc("The user's id"))
+      |@| flag[IsAdmin]('a', Yes, No).mod(doc("Is the user an admin?"))
+      ) { User.apply }
 }
